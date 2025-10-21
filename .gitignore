@@ -2,3 +2,4 @@
 __pycache__/
 trash/
 processed_data/
+.DS_Store
