@@ -2,11 +2,13 @@ import os
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 import warnings
 import argparse
-from dataclasses import dataclass
-from typing import List, Optional
+import json
+from dataclasses import dataclass, asdict
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 
 
 def _safe_import_darts():
@@ -49,9 +51,20 @@ class Config:
 	n_epochs: int = 30
 	random_state: int = 42
 
-	# Output
-	out_dir: str = os.path.join(base_dir, "outputs")
-	pred_csv: str = os.path.join(out_dir, "tft_predictions.csv")
+	# Output & experiment
+	out_root: str = os.path.join(base_dir, "outputs")
+	exp_name: Optional[str] = None
+	pred_csv: Optional[str] = None
+	plot_png: Optional[str] = None
+	metrics_json: Optional[str] = None
+
+	# Options
+	top_k_covariates: int = 0  # 0 means all
+	target_mode: str = "close"  # 'close' or 'logret'
+	learning_rate: float = 1e-3
+	optimizer: str = "adam"
+	use_cosine_scheduler: bool = False
+	val_days: int = 180
 
 
 def read_csv_with_any_date(path: str, date_cols: List[str]) -> Optional[pd.DataFrame]:
@@ -145,7 +158,7 @@ def build_merged_frame(cfg: Config) -> pd.DataFrame:
 
 	covs = load_covariates(cfg)
 
-	# Merge all on date (outer join then sort and ffill)
+	# Merge all on date (outer join then sort)
 	df = base.copy()
 	for cv in covs:
 		df = pd.merge(df, cv, on="date", how="outer")
@@ -158,13 +171,13 @@ def build_merged_frame(cfg: Config) -> pd.DataFrame:
 	mask = (df["date"] >= pd.to_datetime(cfg.train_start)) & (df["date"] <= pd.to_datetime(cfg.test_end))
 	df = df[mask].copy()
 
-	# Reindex to continuous daily calendar and forward/backward fill covariates and target for modeling convenience
+	# Reindex到连续日历，仅向前填充，避免跨区间回填引入未来信息
 	# Ensure unique index before reindex
 	df = df.drop_duplicates(subset=["date"]).set_index("date")
 	full_days = pd.date_range(df.index.min(), df.index.max(), freq="D")
 	df = df.reindex(full_days)
 	df.index.name = "date"
-	df = df.sort_index().ffill().bfill().reset_index()
+	df = df.sort_index().ffill().reset_index()
 
 	# Mark original trading days for evaluation filtering
 	df["is_trading_day"] = df["date"].isin(set(trading_dates))
@@ -173,9 +186,9 @@ def build_merged_frame(cfg: Config) -> pd.DataFrame:
 	# Clean numeric columns: remove infs, ensure no NaNs remain
 	num_cols = [c for c in df.columns if c != "date" and pd.api.types.is_numeric_dtype(df[c])]
 	df[num_cols] = df[num_cols].replace([np.inf, -np.inf], np.nan)
-	df[num_cols] = df[num_cols].ffill().bfill()
-	# In rare case still NaN (all-missing column), fill with column medians or zeros
-	med = df[num_cols].median(numeric_only=True)
+	df[num_cols] = df[num_cols].ffill()
+	train_mask = (df["date"] >= pd.to_datetime(cfg.train_start)) & (df["date"] <= pd.to_datetime(cfg.train_end))
+	med = df.loc[train_mask, num_cols].median(numeric_only=True)
 	df[num_cols] = df[num_cols].fillna(med).fillna(0.0)
 
 	# Ensure target has no NaN and is float
@@ -201,7 +214,16 @@ def pandas_to_timeseries(df: pd.DataFrame, target_col: str, past_cov_cols: List[
 		# Align covariates to target timeline
 		ts_past = ts_past.slice_intersect(ts_target)
 
-	return ts_target, ts_past
+	# future covariates if present in df
+	fut_cols = [c for c in df2.columns if c in ("dow_sin","dow_cos","mon_sin","mon_cos","doy_sin","doy_cos")]
+	ts_future = None
+	if fut_cols:
+		ts_future = TimeSeries.from_dataframe(
+			df2, time_col="date", value_cols=fut_cols, fill_missing_dates=True, freq="D"
+		)
+		ts_future = ts_future.slice_intersect(ts_target)
+
+	return ts_target, ts_past, ts_future
 
 
 def split_series_by_date(series, start: str, end: str):
@@ -215,26 +237,66 @@ def train_and_evaluate(cfg: Config):
 	from darts.dataprocessing.transformers import Scaler
 	from sklearn.metrics import mean_squared_error
 	from darts.models import TFTModel
+	from pytorch_lightning.callbacks import EarlyStopping
+	import torch.optim as optim
 
 	warnings.filterwarnings("ignore")
 
 	print("[1/5] Loading and merging data...")
 	df = build_merged_frame(cfg)
 
-	# Identify past covariate columns: all numeric except target
-	numeric_cols = [c for c in df.columns if c != "date" and pd.api.types.is_numeric_dtype(df[c])]
-	target_col = "close"
-	past_cov_cols = [c for c in numeric_cols if c != target_col]
+	# Identify numeric columns
+	numeric_cols = [c for c in df.columns if c not in ("date","is_trading_day") and pd.api.types.is_numeric_dtype(df[c])]
+	# Select target
+	if cfg.target_mode == "logret":
+		df = df.copy()
+		df["log_close"] = np.log(df["close"].astype(float).clip(lower=1e-12))
+		df["target"] = df["log_close"].diff()
+		target_col = "target"
+	else:
+		target_col = "close"
+
+	# Calendar future covariates are built later in pandas_to_timeseries
+	# Feature selection (by correlation on training subset)
+	cov_candidates = [c for c in numeric_cols if c not in {"close","log_close","target"}]
+	if cfg.top_k_covariates and cfg.top_k_covariates > 0 and cfg.top_k_covariates < len(cov_candidates):
+		train_mask_all = (df["date"] >= pd.to_datetime(cfg.train_start)) & (df["date"] <= pd.to_datetime(cfg.train_end))
+		sub = df.loc[train_mask_all, [target_col]+cov_candidates].dropna()
+		if not sub.empty:
+			corr = sub.corr(numeric_only=True)[target_col].abs().sort_values(ascending=False)
+			ordered = [c for c in corr.index if c != target_col]
+			past_cov_cols = ordered[: cfg.top_k_covariates]
+		else:
+			past_cov_cols = cov_candidates
+	else:
+		past_cov_cols = cov_candidates
 
 	print(f"    total rows: {len(df)}; features: {len(past_cov_cols)}")
 
 	print("[2/5] Building TimeSeries...")
-	ts_target, ts_past = pandas_to_timeseries(df, target_col, past_cov_cols)
+	ts_target, ts_past, ts_future = pandas_to_timeseries(df, target_col, past_cov_cols)
 
 	# Split into train/test ranges
 	ts_train = split_series_by_date(ts_target, cfg.train_start, cfg.train_end)
 	ts_test = split_series_by_date(ts_target, cfg.test_start, cfg.test_end)
+	# validation slice: last cfg.val_days of train range
+	ts_val = None
+	val_start = None
+	if cfg.val_days and cfg.val_days > 0:
+		val_start = (pd.to_datetime(cfg.train_end) - pd.Timedelta(days=cfg.val_days)).strftime("%Y-%m-%d")
+		ts_val_candidate = split_series_by_date(ts_target, val_start, cfg.train_end)
+		# Ensure validation length >= input_chunk_length + output_chunk_length
+		min_needed = cfg.input_chunk_length + cfg.output_chunk_length
+		if len(ts_val_candidate) >= min_needed:
+			ts_val = ts_val_candidate
+		else:
+			print(f"[WARN] Validation window too short (len={len(ts_val_candidate)} < {min_needed}); disabling validation.")
+			val_start = None
+
 	pc_train = split_series_by_date(ts_past, cfg.train_start, cfg.train_end) if ts_past is not None else None
+	pc_val = split_series_by_date(ts_past, val_start, cfg.train_end) if (ts_past is not None and val_start is not None and ts_val is not None) else None
+	fc_train = split_series_by_date(ts_future, cfg.train_start, cfg.train_end) if ts_future is not None else None
+	fc_val = split_series_by_date(ts_future, val_start, cfg.train_end) if (ts_future is not None and val_start is not None and ts_val is not None) else None
 
 	# Scale target and covariates
 	print("[3/5] Scaling...")
@@ -245,11 +307,21 @@ def train_and_evaluate(cfg: Config):
 
 	cov_scaler = Scaler()
 	pc_train_s = cov_scaler.fit_transform(pc_train) if pc_train is not None else None
+	pc_val_s = cov_scaler.transform(pc_val) if pc_val is not None else None
 	pc_full_s = cov_scaler.transform(ts_past) if ts_past is not None else None
+
+	fut_scaler = Scaler()
+	fc_train_s = fut_scaler.fit_transform(fc_train) if fc_train is not None else None
+	fc_val_s = fut_scaler.transform(fc_val) if fc_val is not None else None
+	fc_full_s = fut_scaler.transform(ts_future) if ts_future is not None else None
 
 	# Initialize TFT
 	print("[4/5] Training TFT model...")
-	model = TFTModel(
+	# optimizer
+	opt_map = {"adam": optim.Adam, "adamw": optim.AdamW, "sgd": optim.SGD}
+	optimizer_cls = opt_map.get(cfg.optimizer.lower(), optim.Adam)
+
+	model_kwargs = dict(
 		input_chunk_length=cfg.input_chunk_length,
 		output_chunk_length=cfg.output_chunk_length,
 		hidden_size=cfg.hidden_size,
@@ -262,15 +334,47 @@ def train_and_evaluate(cfg: Config):
 		random_state=cfg.random_state,
 		save_checkpoints=False,
 		pl_trainer_kwargs={"enable_progress_bar": True, "accelerator": "cpu"},
+		optimizer_cls=optimizer_cls,
+		optimizer_kwargs={"lr": cfg.learning_rate},
 	)
 
-	model.fit(series=ts_train_s, past_covariates=pc_train_s, verbose=True)
+	# optional cosine scheduler if supported by this darts version
+	if cfg.use_cosine_scheduler:
+		try:
+			import torch.optim.lr_scheduler as lrs
+
+			model_kwargs.update({
+				"lr_scheduler_cls": lrs.CosineAnnealingLR,
+				"lr_scheduler_kwargs": {"T_max": max(10, cfg.n_epochs)},
+			})
+		except Exception:
+			pass
+
+	# Inject callbacks before model creation
+	callbacks = []
+	if ts_val is not None:
+		callbacks.append(EarlyStopping(monitor="val_loss", mode="min", patience=10))
+		if "pl_trainer_kwargs" in model_kwargs:
+			model_kwargs["pl_trainer_kwargs"]["callbacks"] = callbacks
+
+	model = TFTModel(**model_kwargs)
+
+	model.fit(
+		series=ts_train_s,
+		past_covariates=pc_train_s,
+		future_covariates=fc_train_s,
+		val_series=ts_val,
+		val_past_covariates=pc_val_s,
+		val_future_covariates=fc_val_s,
+		verbose=True,
+	)
 
 	# Historical forecasts across the test window, predicting 1-step ahead iteratively
 	print("[5/5] Forecasting and evaluating...")
 	preds_s = model.historical_forecasts(
 		series=ts_full_s,
 		past_covariates=pc_full_s,
+		future_covariates=fc_full_s,
 		start=pd.to_datetime(cfg.test_start),
 		forecast_horizon=1,
 		stride=1,
@@ -293,36 +397,66 @@ def train_and_evaluate(cfg: Config):
 	preds_aligned = preds.slice_intersect(ts_test)
 
 	# Compute MSE on true trading days only
-	# Build trading-day mask from original df
-	eval_df = pd.DataFrame({
-		"date": ts_test_aligned.time_index,
-		"true_close": ts_test_aligned.values().squeeze(),
-	})
-	eval_df = eval_df.merge(
-		pd.DataFrame({
-			"date": preds_aligned.time_index,
-			"pred_close": preds_aligned.values().squeeze(),
-		}), on="date", how="inner"
-	)
+	# Prepare evaluation depending on target mode
+	if cfg.target_mode == "logret":
+		eval_df = pd.DataFrame({"date": ts_test_aligned.time_index})
+		true_close = df.set_index("date")["close"].reindex(eval_df["date"]).values
+		start_date = pd.to_datetime(cfg.test_start) - pd.Timedelta(days=1)
+		start_close = df.set_index("date")["close"].asof(start_date)
+		pred_logret = preds_aligned.values().squeeze()
+		pred_logprice = np.log(start_close) + np.cumsum(pred_logret)
+		pred_close = np.exp(pred_logprice)
+		eval_df["true_close"] = true_close
+		eval_df["pred_close"] = pred_close
+	else:
+		eval_df = pd.DataFrame({
+			"date": ts_test_aligned.time_index,
+			"true_close": ts_test_aligned.values().squeeze(),
+		})
+		eval_df = eval_df.merge(
+			pd.DataFrame({
+				"date": preds_aligned.time_index,
+				"pred_close": preds_aligned.values().squeeze(),
+			}), on="date", how="inner"
+		)
 	# bring the trading-day indicator from the merged frame
 	eval_df = eval_df.merge(df[["date", "is_trading_day"]], on="date", how="left")
 	eval_df = eval_df[eval_df["is_trading_day"] == True]
+	eval_df = eval_df.dropna(subset=["true_close", "pred_close"]) 
 	test_mse = float(mean_squared_error(eval_df["true_close"], eval_df["pred_close"]))
 	print(f"\nMSE on test trading days [{cfg.test_start} .. {cfg.test_end}]: {test_mse:.6f}")
 
-	# Save predictions
-	os.makedirs(cfg.out_dir, exist_ok=True)
-	df_pred = pd.DataFrame({
-		"date": preds_aligned.time_index,
-		"pred_close": preds_aligned.values().squeeze(),
-	})
-	df_true = pd.DataFrame({
-		"date": ts_test_aligned.time_index,
-		"true_close": ts_test_aligned.values().squeeze(),
-	})
-	out = pd.merge(df_true, df_pred, on="date", how="inner")
+	# experiments: write to dedicated dir
+	os.makedirs(cfg.out_root, exist_ok=True)
+	exp_name = cfg.exp_name or pd.Timestamp.now().strftime("exp_%Y%m%d_%H%M%S")
+	out_dir = os.path.join(cfg.out_root, exp_name)
+	os.makedirs(out_dir, exist_ok=True)
+	cfg.pred_csv = os.path.join(out_dir, "tft_predictions.csv")
+	cfg.plot_png = os.path.join(out_dir, "plot.png")
+	cfg.metrics_json = os.path.join(out_dir, "metrics.json")
+
+	out = eval_df[["date","true_close","pred_close"]].copy()
 	out.to_csv(cfg.pred_csv, index=False)
 	print(f"Predictions saved to: {cfg.pred_csv}")
+
+	with open(cfg.metrics_json, "w") as f:
+		json.dump({"mse": test_mse}, f, indent=2)
+	with open(os.path.join(out_dir, "config.json"), "w") as f:
+		json.dump(asdict(cfg), f, indent=2, default=str)
+
+	# plot
+	try:
+		plt.figure(figsize=(12, 5))
+		plt.plot(out["date"], out["true_close"], label="True Close", linewidth=1.2)
+		plt.plot(out["date"], out["pred_close"], label="Pred Close", linewidth=1.2)
+		plt.legend()
+		plt.title("TFT Predictions vs True (Test)")
+		plt.tight_layout()
+		plt.savefig(cfg.plot_png, dpi=150)
+		plt.close()
+		print(f"Plot saved to: {cfg.plot_png}")
+	except Exception as e:
+		print("Plotting failed:", e)
 
 
 def parse_args() -> Config:
@@ -331,6 +465,14 @@ def parse_args() -> Config:
 	p.add_argument("--input-chunk-length", type=int, default=90, help="Encoder input length (lookback).")
 	p.add_argument("--output-chunk-length", type=int, default=7, help="Decoder output length (multi-step horizon).")
 	p.add_argument("--hidden-size", type=int, default=32, help="Hidden size of TFT model.")
+	p.add_argument("--learning-rate", type=float, default=1e-3, help="Optimizer learning rate.")
+	p.add_argument("--optimizer", type=str, default="adam", choices=["adam","adamw","sgd"], help="Optimizer.")
+	p.add_argument("--use-cosine-scheduler", action="store_true", help="Use cosine annealing LR scheduler if supported.")
+	p.add_argument("--top-k-covariates", type=int, default=0, help="Select top-K covariates by train correlation (0=all).")
+	p.add_argument("--target-mode", type=str, default="close", choices=["close","logret"], help="Target variable.")
+	p.add_argument("--val-days", type=int, default=180, help="Validation days from the end of train period.")
+	p.add_argument("--exp-name", type=str, default=None, help="Experiment name; default is timestamp.")
+	p.add_argument("--plot", action="store_true", help="Deprecated; plotting is always saved.")
 	p.add_argument("--fast", action="store_true", help="Shortcut for quick smoke test (epochs=3, hidden-size=16).")
 	args = p.parse_args()
 	cfg = Config(
@@ -338,6 +480,13 @@ def parse_args() -> Config:
 		output_chunk_length=args.output_chunk_length,
 		hidden_size=args.hidden_size,
 		n_epochs=args.epochs,
+		learning_rate=args.learning_rate,
+		optimizer=args.optimizer,
+		use_cosine_scheduler=args.use_cosine_scheduler,
+		top_k_covariates=args.top_k_covariates,
+		target_mode=args.target_mode,
+		val_days=args.val_days,
+		exp_name=args.exp_name,
 	)
 	if args.fast:
 		cfg.n_epochs = 3

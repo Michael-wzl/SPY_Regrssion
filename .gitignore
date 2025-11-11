@@ -2,3 +2,4 @@
 __pycache__/
 trash/
 .DS_Store
+outputs/
