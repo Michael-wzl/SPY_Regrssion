@@ -5,6 +5,15 @@ import pandas as pd
 from sklearn.decomposition import PCA
 
 def to_logret(prices: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert prices to log returns.
+
+    Args:
+        prices: Prices (pd.DataFrame, pd.Series, or np.ndarray)
+
+    Returns:
+        Log returns in the same type as input prices
+    """
     float_prices = prices.astype(float)
     logret = np.log(float_prices).diff()
     logret.iloc[0] = 0.0
@@ -44,11 +53,28 @@ def from_logret(logrets, init_prices, cumulative: bool = True):
 
 class CovSelector:
     def __init__(self, topk: int = 150, method: str = 'spearman'):
+        """
+        Select top-k features based on correlation with target variable.
+
+        Args:
+            topk: Number of top features to select.
+            method: Correlation method ('spearman' or 'pearson').
+        """
         self.topk = topk
         self.method = method
         self.selected_features_: Optional[List[str]] = None
     
     def fit(self, dfs: pd.DataFrame, target: pd.Series) -> None:
+        """
+        Fit the selector to the data.
+
+        Args:
+            dfs: DataFrame of features.
+            target: Target variable series.
+
+        Raises:
+            ValueError: If unsupported correlation method is provided.
+        """
         if self.method == 'spearman':
             corr_matrix = dfs.corrwith(target, method='spearman').abs()
         elif self.method == 'pearson':
@@ -58,6 +84,15 @@ class CovSelector:
         self.selected_features_ = corr_matrix.nlargest(self.topk).index.tolist()
     
     def transform(self, dfs: pd.DataFrame) -> pd.DataFrame:
+        """
+        Transform the data to keep only selected features.
+
+        Args:
+            dfs: DataFrame of features.
+
+        Returns:
+            DataFrame with only selected features.
+        """
         if self.selected_features_ is None:
             raise ValueError("CovSelector must be fitted before calling transform.")
         return dfs[self.selected_features_]
@@ -65,15 +100,36 @@ class CovSelector:
 
 class ZScoreScaler:
     def __init__(self, eps: float = 1e-8):
+        """
+        Z-Score scaling of features.
+
+        Args:
+            eps: Small value to avoid division by zero.
+        """
         self.eps = eps
         self.means_: Optional[pd.Series] = None
         self.stds_: Optional[pd.Series] = None
 
     def fit(self, dfs: pd.DataFrame) -> None:
+        """
+        Fit the scaler to the data.
+
+        Args:
+            dfs: DataFrame of features.
+        """
         self.means_ = dfs.mean()
         self.stds_ = dfs.std(ddof=0).replace(0, self.eps)
 
     def transform(self, dfs: pd.DataFrame) -> pd.DataFrame:
+        """
+        Transform the data using Z-Score scaling.
+
+        Args:
+            dfs: DataFrame of features.
+
+        Returns:
+            Scaled DataFrame with suffix '_zscorescaled'.
+        """
         if self.means_ is None or self.stds_ is None:
             raise ValueError("ZScoreScaler must be fitted before calling transform.")
         scaled = (dfs - self.means_) / (self.stds_ + self.eps)
@@ -81,16 +137,38 @@ class ZScoreScaler:
     
 class Winsorizer:
     def __init__(self, lower_q: float = 0.01, upper_q: float = 0.99):
+        """
+        Winsorize features by clipping to specified quantiles.
+
+        Args:
+            lower_q: Lower quantile threshold.
+            upper_q: Upper quantile threshold.
+        """
         self.lower_q = lower_q
         self.upper_q = upper_q
         self.q_low_: Optional[pd.Series] = None
         self.q_high_: Optional[pd.Series] = None
 
     def fit(self, dfs: pd.DataFrame) -> None:
+        """
+        Fit the winsorizer to the data.
+
+        Args:
+            dfs: DataFrame of features.
+        """
         self.q_low_ = dfs.quantile(self.lower_q)
         self.q_high_ = dfs.quantile(self.upper_q)
 
     def transform(self, dfs: pd.DataFrame) -> pd.DataFrame:
+        """
+        Transform the data by applying winsorization.
+
+        Args:
+            dfs: DataFrame of features.
+
+        Returns:
+            Winsorized DataFrame with suffix '_winsorized'.
+        """
         if self.q_low_ is None or self.q_high_ is None:
             raise ValueError("Winsorizer must be fitted before calling transform.")
         winsorized = dfs.clip(lower=self.q_low_, upper=self.q_high_, axis=1).add_suffix(f"_winsorized")
@@ -98,15 +176,37 @@ class Winsorizer:
     
 class PCACompressor:
     def __init__(self, n_components: int,rand_state: int = 42):
+        """
+        PCA-based dimensionality reduction.
+
+        Args:
+            n_components: Number of principal components to keep.
+            rand_state: Random state for reproducibility.
+        """
         self.n_components = n_components
         self.rand_state = rand_state
         self.pca_model: Optional[PCA] = None
     
     def fit(self, dfs: pd.DataFrame) -> None:
+        """
+        Fit the PCA model to the data.
+
+        Args:
+            dfs: DataFrame of features.
+        """
         self.pca_model = PCA(n_components=self.n_components, random_state=self.rand_state)
         self.pca_model.fit(dfs)
 
     def transform(self, dfs: pd.DataFrame) -> pd.DataFrame:
+        """
+        Transform the data using the fitted PCA model.
+
+        Args:
+            dfs: DataFrame of features.
+
+        Returns:
+            DataFrame of principal components with columns named 'pca_1', 'pca_2', ..., 'pca_n'.
+        """
         if self.pca_model is None:
             raise ValueError("PCACompressor must be fitted before calling transform.")
         transformed_array = self.pca_model.transform(dfs)
@@ -171,6 +271,12 @@ class Preprocessor:
                 raise ValueError(f"Unsupported operation type: {operation}")
     
     def transform(self, dfs: pd.DataFrame) -> pd.DataFrame:
+        """
+        Apply the preprocessing steps to the data.
+
+        Args:
+            dfs: DataFrame of features to transform.
+        """
         for method, operation, unit in self.process_units:
             if operation == 'a':
                 dfs = pd.concat([dfs, unit.transform(dfs)], axis=1)

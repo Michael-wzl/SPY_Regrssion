@@ -29,7 +29,16 @@ if torch.cuda.is_available():
 WORKING_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def create_timeseries_with_int_index(df_features: pd.DataFrame, df_dates: pd.DataFrame) -> TimeSeries:
-        """Create TimeSeries using integer index to avoid frequency inference issues."""
+        """
+        Create TimeSeries using integer index to avoid frequency inference issues.
+
+        Args:
+            df_features: DataFrame of features.
+            df_dates: DataFrame with a single column of dates corresponding to df_features.
+
+        Returns:
+            Darts TimeSeries object with integer index.
+        """
         df = df_features.reset_index(drop=True)
         # Check for NaNs
         if df.isnull().any().any():
@@ -97,6 +106,12 @@ def plot_predictions(
 
 
 def run(cfgs: OmegaConf) -> None:
+    """
+    Run the TFT time series forecasting experiment.
+
+    Args:
+        cfgs: Configuration dictionary.
+    """
     # Setup paths
     src_data = f"{WORKING_DIR}/data/{cfgs.src_data}"
     res_save_path = f"{WORKING_DIR}/results/{cfgs.exp_name}"
