@@ -6,3 +6,5 @@ pytorch-lightning>=2.2.0
 darts==0.31.0
 tensorboard>=2.14.0
 matplotlib>=3.7.0
+lightgbm>=4.0.0
+xgboost>=1.7.0

@@ -1,5 +1,9 @@
 .vscode/
 __pycache__/
-trash/
 .DS_Store
-outputs/
+__MACOSX/
+
+trash/
+results/
+darts_logs/
+tmp/
