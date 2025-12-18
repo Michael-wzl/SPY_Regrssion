@@ -92,3 +92,13 @@ The preprocessing pipeline is modular and configurable via `pp_steps`. Each step
 - **Target transformation**: Log returns are computed on the full dataset before splitting, ensuring proper continuity
 - **Evaluation**: `historical_forecasts` with `retrain=False` ensures no future information is used during prediction
 - **NaN handling**: Only forward-fill (`ffill`) is used; backward-fill is avoided to prevent leaking future data
+
+## Pretrained Model Performance
+
+The baseline model is trained with the default configuration and achieves the following performance on the test set:
+
+- Training MSE: 29.103605906890895
+- Test MSE: 89.18892824798843
+
+The plot below visualizes the model's predictions against the ground truth prices on the test set:
+![Predictions vs Ground Truth](results/baseline/predictions_plot.png)
