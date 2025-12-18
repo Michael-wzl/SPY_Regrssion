@@ -435,8 +435,8 @@ if __name__ == "__main__":
         'device': 'cuda:0', 
         'exp_name': 'default', 
         'global_random_state': 42,
-        'use_ckpt': False, # If True, will skip training and load model from checkpoint
-        'ckpt_name': 'test_efficient', # The experiment name to load checkpoint from. 
+        'use_ckpt': True, # If True, will skip training and load model from checkpoint
+        'ckpt_name': 'baseline', # The experiment name to load checkpoint from. 
                                   # The checkpoint itself is uniformly named 'tft_model.pt' and 'tft_model.pt.ckpt'
                                   # The folder should contain the weights and model configs.
         # Data  

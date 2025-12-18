@@ -1,0 +1,48 @@
+ckpt_name: test_efficient
+date_col: date
+device: cuda:4
+exp_name: baseline
+global_random_state: 42
+model_cfgs:
+  batch_size: 64
+  dropout: 0.1
+  eta_min: 1.0e-06
+  gradient_clip_val: 0.6
+  hidden_size: 64
+  input_chunk: 30
+  learning_rate: 0.001
+  lstm_layers: 2
+  n_epochs: 50
+  num_attention_heads: 4
+  optimizer: adamw
+  output: logret
+  output_chunk: 1
+  random_state: 42
+  weight_decay: 0.0001
+pp_steps:
+- - cov_select
+  - o
+- - zscore
+  - o
+- - winsor
+  - o
+- - pca
+  - o
+preprocess_cfgs:
+  cov_select:
+    method: spearman
+    topk: 150
+  pca:
+    n_components: 100
+    rand_state: 42
+  winsor:
+    lower_q: 0.01
+    upper_q: 0.99
+  zscore: {}
+src_data: final_dataset.csv
+target_col: spy_ohlcv_1drth_close
+test_end: '2025-05-30'
+test_start: '2022-01-01'
+train_end: '2021-12-31'
+train_start: '2015-01-01'
+use_ckpt: false

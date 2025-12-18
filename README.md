@@ -1,6 +1,6 @@
 # SPY Next-Trading-Day Regression with Temporal Fusion Transformer (TFT)
 
-## How to Use
+## Quick Start
 
 1. Clone the repository:
 
@@ -16,15 +16,23 @@
    pip install -r requirements.txt
    ```
 
-3. Run the training script: (You may set your own config file in the code)
+3. Run the prediction experiment:
+
+   ```bash
+   python tft.py --exp_name test_baseline --device cuda:0
+   ```
+
+## How to Train Your Own Model
+
+1. Run the training script. Remember to set [use_ckpt](tft.py#L423) to False.
 
    ```bash
    python tft.py --exp_name your_experiment_name --device cuda:0
    ```
 
-4. Check results in the `results/your_experiment_name/` directory.
+2. Check results in the `results/your_experiment_name/` directory.
 
-5. Reuse the trained model for inference or further analysis as needed by setting [use_ckpt](tft.py#L423) to True and specifying the checkpoint path in [ckpt_name](tft.py#L424).
+3. Reuse the trained model for inference or further analysis as needed by setting [use_ckpt](tft.py#L423) to True and specifying the checkpoint path in [ckpt_name](tft.py#L424).
 
 ## Pipeline Overview
 

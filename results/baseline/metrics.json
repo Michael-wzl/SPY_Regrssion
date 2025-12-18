@@ -1,0 +1,8 @@
+{
+  "train_mse": 29.103605906890895,
+  "test_mse": 89.18892824798843,
+  "train_rmse": 5.394775797648212,
+  "test_rmse": 9.44398900084008,
+  "train_samples": 1733,
+  "test_samples": 854
+}
